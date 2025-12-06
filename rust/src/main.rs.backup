@@ -1,0 +1,329 @@
+use clap::Parser;
+use colored::*;
+use image::{DynamicImage, GenericImageView};
+use ndarray::{Array, IxDyn};
+use ort::{session::SessionBuilder, Environment, GraphOptimizationLevel, Session, Value};
+use std::error::Error;
+use std::path::PathBuf;
+
+/// Medical Image Classifier - X-ray classification using ONNX
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// Path to the image file to classify
+    #[arg(value_name = "IMAGE")]
+    image_path: PathBuf,
+
+    /// Path to the ONNX model file
+    #[arg(short, long, default_value = "../model/unified_model.onnx")]
+    model: PathBuf,
+
+    /// Show detailed output
+    #[arg(short, long)]
+    verbose: bool,
+}
+
+// Class names matching the model training
+const CLASS_NAMES: [&str; 3] = ["health", "sick", "tb"];
+const CLASS_EMOJIS: [&str; 3] = ["✅", "⚠️ ", "🚨"];
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let args = Args::parse();
+
+    // Initialize ONNX Runtime environment
+    let environment = Environment::builder()
+        .with_name("medical_classifier")
+        .build()?
+        .into_arc();
+
+    // Load the model
+    println!("\n{}", "🔄 Loading ONNX model...".cyan());
+    let mut session = SessionBuilder::new(&environment)?
+        .with_optimization_level(GraphOptimizationLevel::Level3)?
+        .with_model_from_file(&args.model)?;
+    println!("{}", "✅ Model loaded successfully".green());
+
+    if args.verbose {
+        print_model_info(&session);
+    }
+
+    // Load and process image
+    println!(
+        "\n{}",
+        format!("🔄 Processing image: {}", args.image_path.display()).cyan()
+    );
+    let img = image::open(&args.image_path)?;
+    let (width, height) = img.dimensions();
+    println!(
+        "{}",
+        format!("   Original size: {}x{}", width, height).bright_black()
+    );
+
+    // Run inference
+    let outputs = predict(&mut session, &img)?;
+
+    // Display results
+    display_results(&outputs);
+
+    Ok(())
+}
+
+/// Model outputs structure
+struct ModelOutputs {
+    probabilities: Vec<f32>,
+    predicted_class: usize,
+    confidence: f32,
+    top_2_classes: Vec<usize>,
+    top_2_scores: Vec<f32>,
+    confidence_level: i32,
+    entropy: f32,
+}
+
+/// Run inference on an image
+fn predict(session: &mut Session, img: &DynamicImage) -> Result<ModelOutputs, Box<dyn Error>> {
+    let img_rgb = img.to_rgb8();
+    let (width, height) = img.dimensions();
+
+    // Create input tensor as dynamic array (batch=1, height, width, channels=3)
+    // No preprocessing needed - model handles everything!
+    let shape = vec![1, height as usize, width as usize, 3];
+    let mut array_data = vec![0u8; shape.iter().product()];
+
+    for (x, y, pixel) in img_rgb.enumerate_pixels() {
+        let idx = (y as usize * width as usize + x as usize) * 3;
+        array_data[idx] = pixel[0];
+        array_data[idx + 1] = pixel[1];
+        array_data[idx + 2] = pixel[2];
+    }
+
+    let array = Array::from_shape_vec(IxDyn(&shape), array_data)?;
+
+    // Create input value - convert to CowArray
+    let cow_array = ndarray::CowArray::from(&array);
+    let input_tensor_value = Value::from_array(session.allocator(), &cow_array)?;
+
+    // Run inference - get all 7 outputs!
+    let outputs: Vec<Value> = session.run(vec![input_tensor_value])?;
+
+    // The outputs are in alphabetical order by name:
+    // 0: confidence, 1: confidence_level, 2: entropy, 3: predicted_class,
+    // 4: probabilities, 5: top_2_classes, 6: top_2_scores
+
+    // Extract outputs by index
+    // Note: ONNX conversion may output int32 or int64 for argmax operations
+    let confidence = outputs[0].try_extract::<f32>()?.view()[0];
+    let confidence_level = outputs[1].try_extract::<f32>()?.view()[0] as i32;
+    let entropy = outputs[2].try_extract::<f32>()?.view()[0];
+
+    // Try int64 first, fall back to int32 if needed
+    let predicted_class = if let Ok(tensor) = outputs[3].try_extract::<i64>() {
+        tensor.view()[0] as usize
+    } else {
+        outputs[3].try_extract::<i32>()?.view()[0] as usize
+    };
+
+    let probabilities = outputs[4]
+        .try_extract::<f32>()?
+        .view()
+        .to_slice()
+        .unwrap()
+        .to_vec();
+
+    let top_2_classes: Vec<usize> = if let Ok(tensor) = outputs[5].try_extract::<i64>() {
+        tensor.view().iter().map(|&x| x as usize).collect()
+    } else {
+        outputs[5]
+            .try_extract::<i32>()?
+            .view()
+            .iter()
+            .map(|&x| x as usize)
+            .collect()
+    };
+
+    let top_2_scores: Vec<f32> = outputs[6]
+        .try_extract::<f32>()?
+        .view()
+        .to_slice()
+        .unwrap()
+        .to_vec();
+
+    Ok(ModelOutputs {
+        probabilities,
+        predicted_class,
+        confidence,
+        top_2_classes,
+        top_2_scores,
+        confidence_level,
+        entropy,
+    })
+}
+
+/// Display flashy results
+fn display_results(outputs: &ModelOutputs) {
+    let separator = "=".repeat(70);
+    let sub_separator = "-".repeat(70);
+
+    println!("\n{}", separator.bright_black());
+    println!(
+        "{}",
+        "🏥 MEDICAL IMAGE CLASSIFICATION RESULT"
+            .bold()
+            .bright_cyan()
+    );
+    println!("{}", separator.bright_black());
+
+    // Primary prediction
+    println!("\n{}", sub_separator.bright_black());
+    println!("{}", "🎯 PRIMARY PREDICTION".bold().yellow());
+    println!("{}", sub_separator.bright_black());
+
+    let emoji = CLASS_EMOJIS[outputs.predicted_class];
+    let class_name = CLASS_NAMES[outputs.predicted_class].to_uppercase();
+    let confidence_color = if outputs.confidence > 0.9 {
+        "green"
+    } else if outputs.confidence > 0.7 {
+        "yellow"
+    } else {
+        "red"
+    };
+
+    println!(
+        "  {}  Class: {}",
+        emoji,
+        class_name.color(confidence_color).bold()
+    );
+    println!(
+        "  📊  Confidence: {}",
+        format!("{:.2}%", outputs.confidence * 100.0)
+            .color(confidence_color)
+            .bold()
+    );
+
+    let conf_level_str = match outputs.confidence_level {
+        2 => "🟢 HIGH".green(),
+        1 => "🟡 MEDIUM".yellow(),
+        _ => "🔴 LOW".red(),
+    };
+    println!("  🎚️   Confidence Level: {}", conf_level_str.bold());
+    println!(
+        "  📉  Uncertainty (Entropy): {}",
+        format!("{:.6}", outputs.entropy).bright_black()
+    );
+
+    // Top 2 predictions
+    println!("\n{}", sub_separator.bright_black());
+    println!("{}", "📊 TOP 2 PREDICTIONS".bold().yellow());
+    println!("{}", sub_separator.bright_black());
+
+    for (i, (&class_idx, &score)) in outputs
+        .top_2_classes
+        .iter()
+        .zip(outputs.top_2_scores.iter())
+        .enumerate()
+    {
+        let rank = if i == 0 { "🥇" } else { "🥈" };
+        let emoji = CLASS_EMOJIS[class_idx];
+        let class_name = CLASS_NAMES[class_idx].to_uppercase();
+        println!(
+            "  {} {}  {}: {:.2}%",
+            rank,
+            emoji,
+            class_name,
+            score * 100.0
+        );
+    }
+
+    // All probabilities
+    println!("\n{}", sub_separator.bright_black());
+    println!("{}", "📈 ALL CLASS PROBABILITIES".bold().yellow());
+    println!("{}", sub_separator.bright_black());
+
+    for (idx, &prob) in outputs.probabilities.iter().enumerate() {
+        let emoji = CLASS_EMOJIS[idx];
+        let class_name = CLASS_NAMES[idx].to_uppercase();
+        let bar_length = (prob * 40.0) as usize;
+        let bar = "█".repeat(bar_length);
+        let empty = "░".repeat(40 - bar_length);
+        println!(
+            "  {}  {:8} {} {:>6.2}%",
+            emoji,
+            class_name,
+            format!("{}{}", bar, empty).bright_black(),
+            prob * 100.0
+        );
+    }
+
+    // Interpretation
+    println!("\n{}", sub_separator.bright_black());
+    println!("{}", "📋 INTERPRETATION".bold().yellow());
+    println!("{}", sub_separator.bright_black());
+
+    match outputs.confidence_level {
+        2 => println!(
+            "  {} High confidence prediction - Result is reliable",
+            "✅".green()
+        ),
+        1 => println!(
+            "  {} Medium confidence - Consider additional verification",
+            "⚠️ ".yellow()
+        ),
+        _ => println!("  {} Low confidence - Result may be unreliable", "🔴".red()),
+    }
+
+    if outputs.entropy < 0.1 {
+        println!(
+            "  {} Very low uncertainty - Model is very certain",
+            "✅".green()
+        );
+    } else if outputs.entropy < 0.5 {
+        println!(
+            "  {} Low uncertainty - Model is reasonably certain",
+            "✅".green()
+        );
+    } else {
+        println!(
+            "  {} High uncertainty - Model is less certain",
+            "⚠️ ".yellow()
+        );
+    }
+
+    println!("\n{}", separator.bright_black());
+
+    // Clinical recommendation
+    match CLASS_NAMES[outputs.predicted_class] {
+        "health" => println!(
+            "{}",
+            "✅ No abnormalities detected. Continue regular monitoring.".green()
+        ),
+        "sick" => println!(
+            "{}",
+            "⚠️  Sick indicators detected. Recommend medical consultation."
+                .yellow()
+                .bold()
+        ),
+        "tb" => println!(
+            "{}",
+            "🚨 Tuberculosis indicators present. Immediate medical attention required."
+                .red()
+                .bold()
+        ),
+        _ => {}
+    }
+
+    println!("{}\n", separator.bright_black());
+}
+
+/// Print model information
+fn print_model_info(session: &Session) {
+    println!("\n{}", "📋 Model Information:".bright_cyan());
+
+    println!("   Inputs ({} total):", session.inputs.len());
+    for input in session.inputs.iter() {
+        println!("     - {}: {:?}", input.name, input.dimensions);
+    }
+
+    println!("   Outputs ({} total):", session.outputs.len());
+    for output in session.outputs.iter() {
+        println!("     - {}: {:?}", output.name, output.dimensions);
+    }
+}
